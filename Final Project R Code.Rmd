@@ -1,0 +1,330 @@
+---
+title: "Stats Final Project - Group 2"
+authors: Emma, Anchee, Shiona, Bella, Nejma
+date: "2022-11-30"
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+##Setup: load packages, import test and train datasets, recode variables
+
+```{r}
+library(readr)
+library(fastDummies)
+library(glmnet)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(xgboost)
+library(gbm)
+```
+
+```{r}
+train <- read_csv("train.csv") #ID 1460 is the last training house
+test <- read_csv("test.csv") #ID 1461 is the first testing house, 2919 is the last house
+
+test$SalePrice <- 0 #placeholder for later predictions
+
+combined <- rbind(train, test)
+```
+
+The variables we are particularly interested in are:
+
+- MSZoning: The general zoning classification
+- LotArea: Lot size in square feet
+- LotConfig: Lot configuration
+- HouseStyle: Style of dwelling
+- OverallCond: Overall condition rating
+- YearBuilt: Original construction date
+- YearRemodAdd: Remodel date
+- BsmtCond: General condition of the basement
+- HeatingQC: Heating quality and condition
+- CentralAir: Central air conditioning
+- FullBath: Full bathrooms above grade
+- Bedroom: Number of bedrooms above basement level
+- Kitchen: Number of kitchens
+- GarageType: Garage location
+- GarageCars: Size of garage in car capacity
+- PavedDrive: Paved driveway
+- Fence: Fence quality
+- MoSold: Month Sold
+- YrSold: Year Sold
+
+We want to use these variables to predict the SalePrice of a house.
+
+In order to do any sort of analysis, we need to clean up the data. We can start by recoding many of the variables to be factors instead of characters.
+
+```{r}
+#Redefine levels for some variables
+
+combined$MSZoning <- as.factor(combined$MSZoning)
+levels(combined$MSZoning) <- c("C", "FV", "RH", "RL", "RM")
+combined$MSZoning <- as.character(combined$MSZoning)
+
+combined$OverallCond <-as.character(combined$OverallCond)
+
+combined$Fence <- as.factor(combined$Fence)
+levels(combined$Fence) <- c("Fence", "Fence", "Fence", "Fence")
+combined$Fence <- as.character(combined$Fence)
+
+combined$PavedDrive <- as.factor(combined$PavedDrive)
+levels(combined$PavedDrive) <- c("NotPaved", "NotPaved", "Paved")
+combined$PavedDrive <- as.character(combined$PavedDrive)
+
+combined$GarageType <- as.factor(combined$GarageType)
+levels(combined$GarageType) <- c("Attchd", "Attchd", "Attchd", "Attchd", "Detchd", "Detchd")
+combined$GarageType <- as.character(combined$GarageType)
+
+combined$MoSold <- as.factor(combined$MoSold)
+levels(combined$MoSold) <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+combined$MoSold <- as.character(combined$MoSold)
+
+#Replace NA values
+
+combined$Fence <- combined$Fence %>% replace_na("NoFence")
+combined$GarageType <- combined$GarageType %>% replace_na("NoGarage")
+combined$BsmtCond <- combined$BsmtCond %>% replace_na("NoBsmt")
+
+#New binary variable for if a house was sold during/after 2008 recession
+
+combined$SaleInRecession <- ifelse(combined$YrSold >= 2008, "Yes", "No")
+
+#Select only variables we want
+
+combined  <- select(combined, Id, SalePrice, MSZoning, LotArea, LotConfig, HouseStyle, OverallCond, YearBuilt, YearRemodAdd, BsmtCond, HeatingQC, CentralAir, FullBath, BedroomAbvGr, KitchenAbvGr, GarageCars, GarageType, PavedDrive, Fence, MoSold, YrSold, SaleInRecession)
+```
+
+```{r}
+#One-hot variable encoding
+
+combined <- dummy_cols(combined, remove_first_dummy = FALSE, remove_selected_columns = TRUE)
+```
+
+```{r}
+#Split combined data back into train and test sets
+
+train <- combined[1:1460,]
+test <- combined[1461:2919,]
+```
+
+Make training and validation subsets from the original training dataset.
+
+```{r}
+train_set = train %>%
+  sample_frac(0.75)
+
+test_set = train %>%
+  setdiff(train_set)
+
+test_set_price_preds <- select(test_set, Id, SalePrice)
+
+train_y <- as.integer(train_set$SalePrice) - 2
+test_y <- as.integer(test_set$SalePrice) - 2
+train_x <- train_set %>% select(-c(SalePrice, Id))
+test_x <- test_set %>% select(-c(SalePrice, Id))
+```
+
+##Baseline modeling: Multiple regression
+
+We can start with a basic multiple regression model as a baseline for comparison.
+
+```{r}
+lm <- lm(SalePrice ~ . + -(Id), data = train_set)
+summary(lm)
+
+pred_y_lm = predict(lm, test_set)
+
+test_set_price_preds$lm_prices <- pred_y_lm
+test_set_price_preds$lm_prices_error <- abs(test_set_price_preds$SalePrice - test_set_price_preds$lm_prices)
+test_set_price_preds$lm_accuracy <- 1 - (test_set_price_preds$lm_prices_error / test_set_price_preds$SalePrice)
+
+rmse_lm = RMSE(test_y, pred_y_lm)
+cat("RMSE for lm: ", rmse_lm)
+```
+
+As expected, it produces mediocre results, with many insignificant variables and a low R^2 value.
+
+##Advanced modeling: Lasso regression and gradient boosted decision trees
+
+Next, we can try using lasso regression, which addresses variables that exhibit multicolinearity or have little to no influence on SalePrice.
+
+```{r}
+y <- train_set$SalePrice
+x <- as.matrix(select(train_set, -(Id), -(SalePrice)))
+
+cv_model <- cv.glmnet(x, y, alpha = 1)
+
+#find optimal lambda value that minimizes test MSE
+
+best_lambda <- cv_model$lambda.min
+best_lambda
+
+#find coefficients of best model
+
+best_model <- glmnet(x, y, alpha = 1, lambda = best_lambda)
+coef(best_model)
+
+pred_y_lasso <- predict(best_model, as.matrix(test_x))
+
+test_set_price_preds$lasso_prices <- pred_y_lasso
+test_set_price_preds$lasso_prices_error <- abs(test_set_price_preds$SalePrice - test_set_price_preds$lasso_prices)
+test_set_price_preds$lasso_accuracy <- 1 - (test_set_price_preds$lasso_prices_error / test_set_price_preds$SalePrice)
+
+rmse_lasso = RMSE(test_y, pred_y_lasso)
+cat("RMSE for lasso: ", rmse_lasso)
+```
+
+Next, let's try using gradient boosted decision tree models.
+
+Let's first try stochastic gradient boosted decision trees. This method takes quite a while to run, as it uses repeated cross-validation on many different levels of tree depth to find the best possible model.
+
+```{r}
+#Just as a warning: this code block takes a while to run.
+
+fitControl <- trainControl(method = "repeatedcv",
+                           number = 10,
+                           repeats = 10,
+                           allowParallel = TRUE
+                           )
+
+gbmGrid <- expand.grid(interaction.depth = c(4, 5, 6, 7, 8),
+                        n.trees = (1:10)*50, 
+                        shrinkage = 0.1,
+                        n.minobsinnode = 20
+                       )
+
+gbm_model <- train(SalePrice ~ . + -(Id), data = train_set, 
+                 method = "gbm", 
+                 trControl = fitControl,
+                 verbose = FALSE,
+                 tuneGrid = gbmGrid
+                 )
+gbm_model
+
+trellis.par.set(caretTheme())
+plot(gbm_model)
+```
+
+We will also see how well the best model from this process performs.
+
+```{r}
+pred_y_gbm = predict(gbm_model, test_set)
+
+test_set_price_preds$gbm_prices <- pred_y_gbm
+test_set_price_preds$gbm_prices_error <- abs(test_set_price_preds$SalePrice - test_set_price_preds$gbm_prices)
+test_set_price_preds$gbm_accuracy <- 1 - (test_set_price_preds$gbm_prices_error / test_set_price_preds$SalePrice)
+
+rmse_gbm = RMSE(test_y, pred_y_gbm)
+cat("RMSE for stochastic gbm: ", rmse_gbm)
+```
+
+The best option seems to be using a max depth of 4.
+
+We will use this information for another gradient boosted decision tree model type using xgboost since it's far faster than a gbm model.
+
+First, we can use xgboost cross-validation to find the best number of iterations.
+
+```{r}
+xgb_train = xgb.DMatrix(data = as.matrix(train_x), label = train_y)
+xgb_test = xgb.DMatrix(data = as.matrix(test_x), label = test_y)
+
+params <- list(
+  booster = "gbtree",
+  eta = 0.01,
+  max_depth = as.integer(gbm_model$bestTune$interaction.depth),
+  gamma = 5,
+  subsample = 0.5
+)
+
+xgbcv <- xgb.cv(
+  params = params, 
+  data = xgb_train, 
+  nrounds = 1500, 
+  nfold = 5,
+  prediction = TRUE,
+  showsd = TRUE, 
+  stratified = TRUE, 
+  print_every_n = 50, 
+  early_stopping_rounds = 50, 
+  maximize = FALSE
+  )
+
+print(xgbcv$best_iteration)
+min(xgbcv$evaluation_log$test_rmse_mean)
+```
+
+We will use the best number of iterations in an xgboost model. Using this model, we can predict the SalePrice in the xgb_test set and check our error.
+
+
+```{r}
+xgb_model <- xgb.train( 
+  params = params,
+  data = xgb_train,
+  nrounds = xgbcv$best_iteration
+)
+
+xgb_model
+
+pred_y_xgb = predict(xgb_model, xgb_test)
+
+test_set_price_preds$xgb_prices <- pred_y_xgb
+test_set_price_preds$xgb_prices_error <- abs(test_set_price_preds$SalePrice - test_set_price_preds$xgb_prices)
+test_set_price_preds$xgb_accuracy <- 1 - (test_set_price_preds$xgb_prices_error / test_set_price_preds$SalePrice)
+
+rmse_xgb = RMSE(test_y, pred_y_xgb)
+cat("RMSE for xgb: ", rmse_xgb)
+
+importance_matrix <- xgb.importance(
+  feature_names = colnames(xgb_train), 
+  model = xgb_model
+)
+importance_matrix
+
+xgb.plot.importance(importance_matrix, top_n = 10)
+```
+
+##Results: Generating predictions for Test dataset
+
+Let's calculate the accuracies of each model's price predictions.
+
+```{r}
+cat("lm mean error: $", mean(test_set_price_preds$lm_prices_error), "\n")
+cat("lm accuracy:", (mean(test_set_price_preds$lm_accuracy))*100, "%\n")
+
+cat("lasso mean error: $", mean(test_set_price_preds$lasso_prices_error), "\n")
+cat("lasso accuracy:", (mean(test_set_price_preds$lasso_accuracy))*100, "%\n")
+
+cat("gbm mean error: $", mean(test_set_price_preds$gbm_prices_error), "\n")
+cat("gbm accuracy:", (mean(test_set_price_preds$gbm_accuracy))*100, "%\n")
+
+cat("xgb mean error: $", mean(test_set_price_preds$xgb_prices_error), "\n")
+cat("xgb accuracy:", (mean(test_set_price_preds$xgb_accuracy))*100, "%\n")
+```
+
+Now we can use our best model to generate SalePrice predictions for the test data.
+
+```{r}
+test_y_final <- as.integer(test$Id) - 1
+test_x_final <- test %>% select(-c(Id, SalePrice))
+
+xgb_test_final <- xgb.DMatrix(data = as.matrix(test_x_final), label = test_y_final)
+
+final_pred <- predict(xgb_model, xgb_test_final)
+
+test_price_pred <- select(test, Id)
+test_price_pred$SalePrice <- final_pred
+```
+
+Our final output is a data set with just test house ID and its predicted SalePrice.
+
+```{r}
+write.csv(test_price_pred, "test_preds.csv")
+```
+
